@@ -1,0 +1,151 @@
+{{- $ns := .Values.namespace -}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-server
+  namespace: {{ $ns }}
+  labels:
+    app: rag-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rag-server
+  template:
+    metadata:
+      labels:
+        app: rag-server
+    spec:
+      imagePullSecrets:
+        - name: {{ .Values.imagePullSecret }}
+      containers:
+        - name: rag-server
+          image: nvcr.io/nvidia/blueprint/rag-server:2.4.0
+          ports:
+            - containerPort: 8081
+          env:
+            - name: UVICORN_HOST
+              value: "0.0.0.0"
+            - name: UVICORN_PORT
+              value: "8081"
+            - name: APP_LLM_SERVERURL
+              value: "nim-llm:8000"
+            - name: APP_LLM_MODELNAME
+              value: "meta/llama-3.3-nemotron-super-49b-v1.5"
+            - name: APP_LLM_MODELENGINE
+              value: "nvidia-ai-endpoints"
+            - name: APP_EMBEDDINGS_SERVERURL
+              value: "nemoretriever-embedding-ms:8000/v1"
+            - name: APP_EMBEDDINGS_MODELNAME
+              value: "nvidia/llama-3.2-nv-embedqa-1b-v2"
+            - name: APP_EMBEDDINGS_MODELENGINE
+              value: "nvidia-ai-endpoints"
+            - name: APP_EMBEDDINGS_DIMENSIONS
+              value: "1024"
+            - name: APP_RANKING_SERVERURL
+              value: "http://nemoretriever-ranking-ms:8000/v1"
+            - name: APP_RANKING_MODELNAME
+              value: "nvidia/llama-3.2-nv-rerankqa-1b-v2"
+            - name: APP_RANKING_MODELENGINE
+              value: "nvidia-ai-endpoints"
+            - name: APP_VECTORSTORE_URL
+              value: "http://milvus:19530"
+            - name: APP_VECTORSTORE_NAME
+              value: "milvus"
+            - name: APP_VECTORSTORE_INDEXTYPE
+              value: "FLAT"
+            - name: APP_VECTORSTORE_ENABLEGPUSEARCH
+              value: "False"
+            - name: COLLECTION_NAME
+              value: "rag_demo"
+            - name: APP_RETRIEVER_TOPK
+              value: "4"
+            - name: APP_RETRIEVER_SCORETHRESHOLD
+              value: "0.25"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://localhost:4317"
+            - name: OTEL_TRACES_EXPORTER
+              value: "none"
+            - name: OTEL_METRICS_EXPORTER
+              value: "none"
+            - name: LOGLEVEL
+              value: "INFO"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-server
+  namespace: {{ $ns }}
+spec:
+  selector:
+    app: rag-server
+  ports:
+    - port: 8081
+      targetPort: 8081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-frontend
+  namespace: {{ $ns }}
+  labels:
+    app: rag-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rag-frontend
+  template:
+    metadata:
+      labels:
+        app: rag-frontend
+    spec:
+      imagePullSecrets:
+        - name: {{ .Values.imagePullSecret }}
+      containers:
+        - name: frontend
+          image: nvcr.io/nvidia/blueprint/rag-frontend:2.4.0
+          ports:
+            - containerPort: 3000
+          env:
+            - name: APP_SERVERURL
+              value: "http://rag-server:8081"
+            - name: APP_MODELNAME
+              value: "meta/llama-3.3-nemotron-super-49b-v1.5"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-frontend
+  namespace: {{ $ns }}
+spec:
+  type: NodePort
+  selector:
+    app: rag-frontend
+  ports:
+    - port: 3000
+      targetPort: 3000
+

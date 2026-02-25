@@ -1,0 +1,7 @@
+apiVersion: v2
+name: rag-demo
+description: RAG Blueprint demo with mock NIM services for RunAI AI Applications
+type: application
+version: 0.1.0
+appVersion: "2.4.0"
+

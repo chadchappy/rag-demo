@@ -1,0 +1,78 @@
+{{- $ns := .Values.namespace -}}
+{{- $nims := list
+  (dict "name" "nim-llm" "mode" "llm" "model" "meta/llama-3.3-nemotron-super-49b-v1.5" "port" 8000)
+  (dict "name" "nemoretriever-embedding-ms" "mode" "embedding" "model" "nvidia/llama-3.2-nv-embedqa-1b-v2" "port" 8000)
+  (dict "name" "nemoretriever-ranking-ms" "mode" "reranking" "model" "nvidia/llama-3.2-nv-rerankqa-1b-v2" "port" 8000)
+}}
+{{- range $nim := $nims }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $nim.name }}
+  namespace: {{ $ns }}
+  labels:
+    app: {{ $nim.name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ $nim.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ $nim.name }}
+    spec:
+      containers:
+        - name: {{ $nim.name }}
+          image: python:3.11-slim
+          command: ["python3", "/scripts/server.py"]
+          env:
+            - name: NIM_MODE
+              value: {{ $nim.mode | quote }}
+            - name: NIM_MODEL_NAME
+              value: {{ $nim.model | quote }}
+            - name: NIM_PORT
+              value: {{ $nim.port | quote }}
+          ports:
+            - containerPort: {{ $nim.port }}
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          readinessProbe:
+            httpGet:
+              path: /v1/health/ready
+              port: {{ $nim.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /v1/health/live
+              port: {{ $nim.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          volumeMounts:
+            - name: server-script
+              mountPath: /scripts
+      volumes:
+        - name: server-script
+          configMap:
+            name: mock-nim-server
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $nim.name }}
+  namespace: {{ $ns }}
+spec:
+  selector:
+    app: {{ $nim.name }}
+  ports:
+    - port: {{ $nim.port }}
+      targetPort: {{ $nim.port }}
+{{- end }}
+
