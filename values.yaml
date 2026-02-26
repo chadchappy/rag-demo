@@ -1,3 +1,9 @@
 namespace: runai-team-a
 imagePullSecret: dockerregistry-ngcapikey-nvcrio
 
+ingress:
+  enabled: true
+  host: us-demo-west.runailabs-ps.com
+  ingressClassName: nginx
+  basePath: /team-a/rag-demo
+

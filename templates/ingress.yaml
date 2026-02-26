@@ -1,0 +1,75 @@
+{{- if .Values.ingress.enabled }}
+{{- $ns := .Values.namespace -}}
+{{- $host := .Values.ingress.host -}}
+{{- $basePath := .Values.ingress.basePath -}}
+---
+# Ingress 1: RAG Server API — rewrite /team-a/rag-demo/api/* → /*
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rag-demo-api
+  namespace: {{ $ns }}
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "8g"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: {{ .Values.ingress.ingressClassName }}
+  rules:
+    - host: {{ $host }}
+      http:
+        paths:
+          - path: {{ $basePath }}/api(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: rag-server
+                port:
+                  number: 8081
+---
+# Ingress 2: RAG Frontend — rewrite /team-a/rag-demo/* → /*
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rag-demo-frontend
+  namespace: {{ $ns }}
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "8g"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: {{ .Values.ingress.ingressClassName }}
+  rules:
+    - host: {{ $host }}
+      http:
+        paths:
+          - path: {{ $basePath }}(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: rag-frontend
+                port:
+                  number: 3000
+---
+# Ingress 3: Frontend static assets — catch /assets/* and /favicon.ico
+# (needed because the SPA uses absolute paths for JS/CSS bundles)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rag-demo-assets
+  namespace: {{ $ns }}
+spec:
+  ingressClassName: {{ .Values.ingress.ingressClassName }}
+  rules:
+    - host: {{ $host }}
+      http:
+        paths:
+          - path: /assets
+            pathType: Prefix
+            backend:
+              service:
+                name: rag-frontend
+                port:
+                  number: 3000
+{{- end }}
+

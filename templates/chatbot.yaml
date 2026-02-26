@@ -1,0 +1,7 @@
+{{- /*
+  The InteractiveWorkload CRD is managed by RunAI control plane.
+  It must be created via the RunAI API, not directly via kubectl/helm.
+  See chatbot-create.sh for the API call to create this workload.
+  This template only deploys the ConfigMap (chatbot-configmap.yaml).
+*/ -}}
+
