@@ -6,17 +6,111 @@ metadata:
 data:
   server.py: |
     #!/usr/bin/env python3
-    """Mock Ingestor Server — implements the NVIDIA RAG Blueprint ingestor API.
-    Handles collections CRUD, document upload (fake), health, and status endpoints.
-    All data is stored in-memory (lost on restart, which is fine for demo)."""
-    import json,os,time,uuid,re
+    """Mock Ingestor Server — Milvus-integrated version.
+    Creates real collections in Milvus, parses multipart uploads,
+    generates embeddings via mock NIM, and inserts into Milvus."""
+    import json,os,time,uuid,re,random,io
     from http.server import HTTPServer,BaseHTTPRequestHandler
     from urllib.parse import urlparse,parse_qs
+    from urllib.request import Request,urlopen
+    from urllib.error import URLError
 
     PORT=int(os.environ.get("INGESTOR_PORT","8082"))
-    COLLECTIONS={}  # name -> {collection_name, num_entities, metadata_schema}
-    DOCUMENTS={}    # collection_name -> [{document_name, metadata}]
-    TASKS={}        # task_id -> {state, result}
+    MILVUS=os.environ.get("MILVUS_URL","http://milvus:19530")
+    EMB_DIM=int(os.environ.get("EMBEDDING_DIM","1024"))
+    EMB_URL=os.environ.get("EMBEDDING_URL","http://nemoretriever-embedding-ms:8000/v1/embeddings")
+    DOCUMENTS={}  # collection -> [{document_name, metadata}]
+    TASKS={}      # task_id -> {state, result}
+
+    def milvus_api(endpoint, payload):
+        """Call Milvus REST API v2."""
+        url=f"{MILVUS}/v2/vectordb/{endpoint}"
+        data=json.dumps(payload).encode()
+        try:
+            req=Request(url,data=data,headers={"Content-Type":"application/json"})
+            resp=urlopen(req,timeout=10)
+            return json.loads(resp.read())
+        except Exception as e:
+            print(f"[milvus] {endpoint} error: {e}")
+            return {"code":1,"message":str(e)}
+
+    def create_milvus_collection(name):
+        """Create collection in Milvus with schema matching rag-server expectations."""
+        schema={"autoId":True,"enableDynamicField":True,
+            "fields":[
+                {"fieldName":"pk","dataType":"Int64","isPrimary":True},
+                {"fieldName":"text","dataType":"VarChar","elementTypeParams":{"max_length":"65535"}},
+                {"fieldName":"source","dataType":"VarChar","elementTypeParams":{"max_length":"512"}},
+                {"fieldName":"vector","dataType":"FloatVector","elementTypeParams":{"dim":str(EMB_DIM)}}
+            ]}
+        r=milvus_api("collections/create",{"collectionName":name,"schema":schema})
+        if r.get("code",0)==0 or "already exists" in r.get("message","").lower():
+            # create index and load
+            milvus_api("indexes/create",{"collectionName":name,
+                "indexParams":[{"fieldName":"vector","indexName":"vec_idx",
+                "metricType":"L2","params":{"index_type":"FLAT"}}]})
+            milvus_api("collections/load",{"collectionName":name})
+            return True
+        print(f"[milvus] create failed: {r}")
+        return False
+
+    def list_milvus_collections():
+        r=milvus_api("collections/list",{})
+        return r.get("data",[]) if r.get("code",0)==0 else []
+
+    def drop_milvus_collection(name):
+        return milvus_api("collections/drop",{"collectionName":name})
+
+    def get_embeddings(texts):
+        """Get embeddings from mock NIM service; fallback to random."""
+        try:
+            data=json.dumps({"input":texts,"model":"mock"}).encode()
+            req=Request(EMB_URL,data=data,headers={"Content-Type":"application/json"})
+            resp=urlopen(req,timeout=10)
+            r=json.loads(resp.read())
+            return [d["embedding"] for d in r["data"]]
+        except Exception as e:
+            print(f"[embed] fallback to random: {e}")
+            return [[round(random.gauss(0,0.1),6) for _ in range(EMB_DIM)] for _ in texts]
+
+    def insert_into_milvus(collection, texts, sources, vectors):
+        """Insert documents into Milvus collection."""
+        payload={"collectionName":collection,
+            "data":[{"text":t,"source":s,"vector":v} for t,s,v in zip(texts,sources,vectors)]}
+        return milvus_api("entities/insert",payload)
+
+    def parse_multipart(headers, body_bytes):
+        """Parse multipart/form-data to extract files and fields."""
+        ct=headers.get("Content-Type","")
+        boundary=None
+        for part in ct.split(";"):
+            part=part.strip()
+            if part.startswith("boundary="):
+                boundary=part[9:].strip('"')
+        if not boundary:
+            return {}, {}
+        fields={}; files={}
+        parts=body_bytes.split(f"--{boundary}".encode())
+        for p in parts:
+            if not p or p.strip()==b"--" or p.strip()==b"":
+                continue
+            if b"\r\n\r\n" in p:
+                hdr,content=p.split(b"\r\n\r\n",1)
+            elif b"\n\n" in p:
+                hdr,content=p.split(b"\n\n",1)
+            else:
+                continue
+            content=content.rstrip(b"\r\n--").rstrip(b"\r\n")
+            hdr_str=hdr.decode("utf-8","ignore")
+            name_m=re.search(r'name="([^"]+)"',hdr_str)
+            fname_m=re.search(r'filename="([^"]+)"',hdr_str)
+            if name_m:
+                n=name_m.group(1)
+                if fname_m:
+                    files[n]={"filename":fname_m.group(1),"content":content}
+                else:
+                    fields[n]=content.decode("utf-8","ignore")
+        return fields, files
 
     class H(BaseHTTPRequestHandler):
         def _j(self,code,d):
@@ -27,12 +121,11 @@ data:
             self.send_header("Access-Control-Allow-Origin","*")
             self.end_headers()
             self.wfile.write(b)
-        def _body(self):
+        def _raw_body(self):
             n=int(self.headers.get("Content-Length",0))
-            return json.loads(self.rfile.read(n)) if n else {}
+            return self.rfile.read(n) if n else b""
         def _path(self):
             p=urlparse(self.path)
-            # strip /v1 prefix if present
             path=re.sub(r'^/v1','',p.path)
             return path, parse_qs(p.query)
 
@@ -48,53 +141,84 @@ data:
             if path=="/health":
                 self._j(200,{"message":"Service is up.","databases":[],"object_storage":[],"nim":[]})
             elif path=="/collections":
-                cols=[{"collection_name":n,"num_entities":c.get("num_entities",0),
-                       "metadata_schema":c.get("metadata_schema",[])} for n,c in COLLECTIONS.items()]
+                names=list_milvus_collections()
+                cols=[{"collection_name":n,"num_entities":len(DOCUMENTS.get(n,[])),"metadata_schema":[]} for n in names]
                 self._j(200,{"message":"","total_collections":len(cols),"collections":cols})
             elif path=="/documents":
-                cn=qs.get("collection_name",["multimodal_data"])[0]
+                cn=qs.get("collection_name",["default"])[0]
                 docs=DOCUMENTS.get(cn,[])
                 self._j(200,{"message":"","total_documents":len(docs),"documents":docs})
             elif path=="/status":
                 tid=qs.get("task_id",[""])[0]
-                if tid in TASKS:
-                    self._j(200,TASKS[tid])
-                else:
-                    self._j(200,{"state":"completed","result":{"message":"Done","total_documents":0,"documents":[],"failed_documents":[],"validation_errors":[]}})
+                t=TASKS.get(tid,{"state":"completed","result":{"message":"Done","total_documents":0,"documents":[],"failed_documents":[],"validation_errors":[]}})
+                self._j(200,t)
             else:
                 self._j(404,{"detail":"Not Found"})
 
         def do_POST(self):
             path,qs=self._path()
             if path=="/collection":
-                ct=self.headers.get("Content-Type","")
-                body=self._body() if "json" in ct else {}
-                name=body.get("collection_name","multimodal_data")
-                dim=body.get("embedding_dimension",2048)
-                schema=body.get("metadata_schema",[])
-                COLLECTIONS[name]={"collection_name":name,"num_entities":0,"metadata_schema":schema,"embedding_dimension":dim}
+                raw=self._raw_body()
+                body=json.loads(raw) if raw else {}
+                name=body.get("collection_name","default")
+                ok=create_milvus_collection(name)
                 DOCUMENTS.setdefault(name,[])
-                self._j(200,{"message":f"Collection '{name}' created successfully.","collection_name":name})
+                if ok:
+                    self._j(200,{"message":f"Collection '{name}' created successfully.","collection_name":name})
+                else:
+                    self._j(500,{"message":f"Failed to create collection '{name}' in Milvus"})
             elif path=="/collections":
-                ct=self.headers.get("Content-Type","")
-                body=self._body() if "json" in ct else []
+                raw=self._raw_body()
+                body=json.loads(raw) if raw else []
                 names=body if isinstance(body,list) else [body]
                 ok=[]
                 for n in names:
-                    COLLECTIONS[n]={"collection_name":n,"num_entities":0,"metadata_schema":[]}
-                    DOCUMENTS.setdefault(n,[])
-                    ok.append(n)
+                    if create_milvus_collection(n):
+                        DOCUMENTS.setdefault(n,[])
+                        ok.append(n)
                 self._j(200,{"message":"Collections created.","successful":ok,"failed":[],"total_success":len(ok),"total_failed":0})
             elif path=="/documents":
-                # fake document upload — just record the filename
-                tid=uuid.uuid4().hex[:12]
-                TASKS[tid]={"state":"completed","result":{"message":"Ingestion complete.","total_documents":1,"documents":[{"document_name":"uploaded_doc.pdf","metadata":{}}],"failed_documents":[],"validation_errors":[]}}
-                # try to parse multipart to get collection name — fallback to default
-                cn="multimodal_data"
+                raw=self._raw_body()
+                fields,files=parse_multipart(self.headers,raw)
+                # extract collection name from 'data' JSON field
+                cn="default"
+                if "data" in fields:
+                    try:
+                        d=json.loads(fields["data"])
+                        cn=d.get("collection_name",cn)
+                    except: pass
+                # ensure collection exists
+                if cn not in [c for c in list_milvus_collections()]:
+                    create_milvus_collection(cn)
                 DOCUMENTS.setdefault(cn,[])
-                DOCUMENTS[cn].append({"document_name":"uploaded_doc.pdf","metadata":{}})
-                if cn in COLLECTIONS:
-                    COLLECTIONS[cn]["num_entities"]=COLLECTIONS[cn].get("num_entities",0)+1
+                # process uploaded file
+                fname="uploaded_doc.txt"
+                text_content="Sample document content for demo."
+                if "documents" in files:
+                    fname=files["documents"]["filename"]
+                    raw_content=files["documents"]["content"]
+                    try:
+                        text_content=raw_content.decode("utf-8","ignore")
+                    except:
+                        text_content=f"Binary file: {fname}"
+                # chunk text into segments (~500 chars each)
+                chunks=[]
+                chunk_size=500
+                if len(text_content)>chunk_size:
+                    for i in range(0,len(text_content),chunk_size):
+                        chunks.append(text_content[i:i+chunk_size])
+                else:
+                    chunks=[text_content]
+                # get embeddings and insert into Milvus
+                embeddings=get_embeddings(chunks)
+                sources=[fname]*len(chunks)
+                r=insert_into_milvus(cn,chunks,sources,embeddings)
+                inserted=r.get("data",{}).get("insertCount",len(chunks)) if r.get("code",0)==0 else 0
+                DOCUMENTS[cn].append({"document_name":fname,"metadata":{"chunks":len(chunks),"inserted":inserted}})
+                tid=uuid.uuid4().hex[:12]
+                TASKS[tid]={"state":"completed","result":{"message":"Ingestion complete.","total_documents":1,
+                    "documents":[{"document_name":fname,"metadata":{}}],"failed_documents":[],"validation_errors":[]}}
+                print(f"[ingestor] Ingested {fname} -> {len(chunks)} chunks -> {inserted} vectors into '{cn}'")
                 self._j(200,{"message":"Background Ingestion Started","task_id":tid})
             else:
                 self._j(404,{"detail":"Not Found"})
@@ -109,20 +233,18 @@ data:
         def do_DELETE(self):
             path,qs=self._path()
             if path=="/collections":
-                ct=self.headers.get("Content-Type","")
-                n=int(self.headers.get("Content-Length",0))
-                body=json.loads(self.rfile.read(n)) if n and "json" in ct else []
+                raw=self._raw_body()
+                body=json.loads(raw) if raw else []
                 ok=[]
                 for name in body:
-                    COLLECTIONS.pop(name,None)
+                    drop_milvus_collection(name)
                     DOCUMENTS.pop(name,None)
                     ok.append(name)
                 self._j(200,{"message":"Collections deleted.","successful":ok,"failed":[],"total_success":len(ok),"total_failed":0})
             elif path=="/documents":
-                cn=qs.get("collection_name",["multimodal_data"])[0]
-                ct=self.headers.get("Content-Type","")
-                n=int(self.headers.get("Content-Length",0))
-                body=json.loads(self.rfile.read(n)) if n and "json" in ct else []
+                cn=qs.get("collection_name",["default"])[0]
+                raw=self._raw_body()
+                body=json.loads(raw) if raw else []
                 DOCUMENTS[cn]=[d for d in DOCUMENTS.get(cn,[]) if d["document_name"] not in body]
                 docs=DOCUMENTS.get(cn,[])
                 self._j(200,{"message":"","total_documents":len(docs),"documents":docs})
@@ -134,5 +256,7 @@ data:
 
     if __name__=="__main__":
         print(f"Mock Ingestor Server on port {PORT}")
+        print(f"  Milvus: {MILVUS}, Embedding dim: {EMB_DIM}")
+        print(f"  Embedding URL: {EMB_URL}")
         HTTPServer(("0.0.0.0",PORT),H).serve_forever()
 
