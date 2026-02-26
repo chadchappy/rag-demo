@@ -50,26 +50,5 @@ spec:
                 name: rag-frontend
                 port:
                   number: 3000
----
-# Ingress 3: Frontend static assets — catch /assets/* and /favicon.ico
-# (needed because the SPA uses absolute paths for JS/CSS bundles)
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: rag-demo-assets
-  namespace: {{ $ns }}
-spec:
-  ingressClassName: {{ .Values.ingress.ingressClassName }}
-  rules:
-    - host: {{ $host }}
-      http:
-        paths:
-          - path: /assets
-            pathType: Prefix
-            backend:
-              service:
-                name: rag-frontend
-                port:
-                  number: 3000
 {{- end }}
 
