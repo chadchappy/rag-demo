@@ -1,0 +1,138 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mock-ingestor-server
+  namespace: {{ .Values.namespace }}
+data:
+  server.py: |
+    #!/usr/bin/env python3
+    """Mock Ingestor Server — implements the NVIDIA RAG Blueprint ingestor API.
+    Handles collections CRUD, document upload (fake), health, and status endpoints.
+    All data is stored in-memory (lost on restart, which is fine for demo)."""
+    import json,os,time,uuid,re
+    from http.server import HTTPServer,BaseHTTPRequestHandler
+    from urllib.parse import urlparse,parse_qs
+
+    PORT=int(os.environ.get("INGESTOR_PORT","8082"))
+    COLLECTIONS={}  # name -> {collection_name, num_entities, metadata_schema}
+    DOCUMENTS={}    # collection_name -> [{document_name, metadata}]
+    TASKS={}        # task_id -> {state, result}
+
+    class H(BaseHTTPRequestHandler):
+        def _j(self,code,d):
+            b=json.dumps(d).encode()
+            self.send_response(code)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Content-Length",str(len(b)))
+            self.send_header("Access-Control-Allow-Origin","*")
+            self.end_headers()
+            self.wfile.write(b)
+        def _body(self):
+            n=int(self.headers.get("Content-Length",0))
+            return json.loads(self.rfile.read(n)) if n else {}
+        def _path(self):
+            p=urlparse(self.path)
+            # strip /v1 prefix if present
+            path=re.sub(r'^/v1','',p.path)
+            return path, parse_qs(p.query)
+
+        def do_OPTIONS(self):
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin","*")
+            self.send_header("Access-Control-Allow-Methods","GET,POST,PATCH,DELETE,OPTIONS")
+            self.send_header("Access-Control-Allow-Headers","Content-Type")
+            self.end_headers()
+
+        def do_GET(self):
+            path,qs=self._path()
+            if path=="/health":
+                self._j(200,{"message":"Service is up.","databases":[],"object_storage":[],"nim":[]})
+            elif path=="/collections":
+                cols=[{"collection_name":n,"num_entities":c.get("num_entities",0),
+                       "metadata_schema":c.get("metadata_schema",[])} for n,c in COLLECTIONS.items()]
+                self._j(200,{"message":"","total_collections":len(cols),"collections":cols})
+            elif path=="/documents":
+                cn=qs.get("collection_name",["multimodal_data"])[0]
+                docs=DOCUMENTS.get(cn,[])
+                self._j(200,{"message":"","total_documents":len(docs),"documents":docs})
+            elif path=="/status":
+                tid=qs.get("task_id",[""])[0]
+                if tid in TASKS:
+                    self._j(200,TASKS[tid])
+                else:
+                    self._j(200,{"state":"completed","result":{"message":"Done","total_documents":0,"documents":[],"failed_documents":[],"validation_errors":[]}})
+            else:
+                self._j(404,{"detail":"Not Found"})
+
+        def do_POST(self):
+            path,qs=self._path()
+            if path=="/collection":
+                ct=self.headers.get("Content-Type","")
+                body=self._body() if "json" in ct else {}
+                name=body.get("collection_name","multimodal_data")
+                dim=body.get("embedding_dimension",2048)
+                schema=body.get("metadata_schema",[])
+                COLLECTIONS[name]={"collection_name":name,"num_entities":0,"metadata_schema":schema,"embedding_dimension":dim}
+                DOCUMENTS.setdefault(name,[])
+                self._j(200,{"message":f"Collection '{name}' created successfully.","collection_name":name})
+            elif path=="/collections":
+                ct=self.headers.get("Content-Type","")
+                body=self._body() if "json" in ct else []
+                names=body if isinstance(body,list) else [body]
+                ok=[]
+                for n in names:
+                    COLLECTIONS[n]={"collection_name":n,"num_entities":0,"metadata_schema":[]}
+                    DOCUMENTS.setdefault(n,[])
+                    ok.append(n)
+                self._j(200,{"message":"Collections created.","successful":ok,"failed":[],"total_success":len(ok),"total_failed":0})
+            elif path=="/documents":
+                # fake document upload — just record the filename
+                tid=uuid.uuid4().hex[:12]
+                TASKS[tid]={"state":"completed","result":{"message":"Ingestion complete.","total_documents":1,"documents":[{"document_name":"uploaded_doc.pdf","metadata":{}}],"failed_documents":[],"validation_errors":[]}}
+                # try to parse multipart to get collection name — fallback to default
+                cn="multimodal_data"
+                DOCUMENTS.setdefault(cn,[])
+                DOCUMENTS[cn].append({"document_name":"uploaded_doc.pdf","metadata":{}})
+                if cn in COLLECTIONS:
+                    COLLECTIONS[cn]["num_entities"]=COLLECTIONS[cn].get("num_entities",0)+1
+                self._j(200,{"message":"Background Ingestion Started","task_id":tid})
+            else:
+                self._j(404,{"detail":"Not Found"})
+
+        def do_PATCH(self):
+            path,qs=self._path()
+            if path=="/documents":
+                self._j(200,{"message":"Documents updated.","total_documents":0,"documents":[]})
+            else:
+                self._j(404,{"detail":"Not Found"})
+
+        def do_DELETE(self):
+            path,qs=self._path()
+            if path=="/collections":
+                ct=self.headers.get("Content-Type","")
+                n=int(self.headers.get("Content-Length",0))
+                body=json.loads(self.rfile.read(n)) if n and "json" in ct else []
+                ok=[]
+                for name in body:
+                    COLLECTIONS.pop(name,None)
+                    DOCUMENTS.pop(name,None)
+                    ok.append(name)
+                self._j(200,{"message":"Collections deleted.","successful":ok,"failed":[],"total_success":len(ok),"total_failed":0})
+            elif path=="/documents":
+                cn=qs.get("collection_name",["multimodal_data"])[0]
+                ct=self.headers.get("Content-Type","")
+                n=int(self.headers.get("Content-Length",0))
+                body=json.loads(self.rfile.read(n)) if n and "json" in ct else []
+                DOCUMENTS[cn]=[d for d in DOCUMENTS.get(cn,[]) if d["document_name"] not in body]
+                docs=DOCUMENTS.get(cn,[])
+                self._j(200,{"message":"","total_documents":len(docs),"documents":docs})
+            else:
+                self._j(404,{"detail":"Not Found"})
+
+        def log_message(self,fmt,*a):
+            print(f"[ingestor] {self.command} {self.path} -> {a[1] if len(a)>1 else ''}")
+
+    if __name__=="__main__":
+        print(f"Mock Ingestor Server on port {PORT}")
+        HTTPServer(("0.0.0.0",PORT),H).serve_forever()
+

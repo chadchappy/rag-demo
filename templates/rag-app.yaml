@@ -149,8 +149,54 @@ spec:
     - port: 3000
       targetPort: 3000
 ---
-# Alias service for ingestor-server — the rag-playground frontend expects this
-# for document/collection management. Routes to rag-server on port 8081.
+# Mock ingestor-server deployment — handles collection/document management APIs
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-ingestor
+  namespace: {{ $ns }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-ingestor
+  template:
+    metadata:
+      labels:
+        app: mock-ingestor
+    spec:
+      containers:
+        - name: ingestor
+          image: python:3.11-slim
+          command: ["python3", "/app/server.py"]
+          env:
+            - name: INGESTOR_PORT
+              value: "8082"
+          ports:
+            - containerPort: 8082
+          volumeMounts:
+            - name: server-script
+              mountPath: /app
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8082
+            initialDelaySeconds: 3
+            periodSeconds: 10
+      volumes:
+        - name: server-script
+          configMap:
+            name: mock-ingestor-server
+---
+# Ingestor-server service — the rag-playground frontend expects this
+# for document/collection management.
 apiVersion: v1
 kind: Service
 metadata:
@@ -158,7 +204,7 @@ metadata:
   namespace: {{ $ns }}
 spec:
   selector:
-    app: rag-server
+    app: mock-ingestor
   ports:
     - port: 8082
-      targetPort: 8081
+      targetPort: 8082
