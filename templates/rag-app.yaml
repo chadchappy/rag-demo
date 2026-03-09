@@ -128,6 +128,8 @@ spec:
               value: "http://rag-server:8081"
             - name: APP_MODELNAME
               value: "meta/llama-3.3-nemotron-super-49b-v1.5"
+            - name: APP_INGESTORURL
+              value: "http://ingestor-server:8082"
           resources:
             requests:
               cpu: "50m"

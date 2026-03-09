@@ -1,0 +1,74 @@
+{{- $ns := .Values.namespace -}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestor-server
+  namespace: {{ $ns }}
+  labels:
+    app: ingestor-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ingestor-server
+  template:
+    metadata:
+      labels:
+        app: ingestor-server
+    spec:
+      containers:
+        - name: ingestor
+          image: python:3.11-slim
+          command: ["python3", "/scripts/ingestor.py"]
+          env:
+            - name: INGESTOR_PORT
+              value: "8082"
+            - name: APP_VECTORSTORE_URL
+              value: "http://milvus:19530"
+            - name: APP_EMBEDDINGS_DIMENSIONS
+              value: "1024"
+            - name: COLLECTION_NAME
+              value: "rag_demo"
+            - name: LOGLEVEL
+              value: "INFO"
+          ports:
+            - containerPort: 8082
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8082
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /v1/health
+              port: 8082
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          volumeMounts:
+            - name: ingestor-script
+              mountPath: /scripts
+      volumes:
+        - name: ingestor-script
+          configMap:
+            name: ingestor-service-scripts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingestor-server
+  namespace: {{ $ns }}
+spec:
+  selector:
+    app: ingestor-server
+  ports:
+    - port: 8082
+      targetPort: 8082

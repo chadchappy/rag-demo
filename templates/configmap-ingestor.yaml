@@ -1,0 +1,176 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ingestor-service-scripts
+  namespace: {{ .Values.namespace }}
+data:
+  ingestor.py: |
+    #!/usr/bin/env python3
+    """Lightweight ingestor service for RAG Blueprint demo.
+    Implements the collections/documents APIs that the rag-frontend
+    expects on port 8082, backed by the Milvus REST API.
+    Handles routes both with and without /v1 prefix since the frontend
+    proxy strips /api and forwards directly (e.g. /collection, /collections).
+    """
+    import json,logging,os
+    from http.server import HTTPServer,BaseHTTPRequestHandler
+    from urllib.request import Request,urlopen
+    from urllib.error import URLError
+    from urllib.parse import urlparse,parse_qs
+    
+    logging.basicConfig(level=os.environ.get("LOGLEVEL","INFO").upper(),
+        format="%(asctime)s %(levelname)s %(message)s")
+    log=logging.getLogger("ingestor")
+    
+    MILVUS=os.environ.get("APP_VECTORSTORE_URL","http://milvus:19530")
+    EMB_DIM=int(os.environ.get("APP_EMBEDDINGS_DIMENSIONS","1024"))
+    PORT=int(os.environ.get("INGESTOR_PORT","8082"))
+    DEFAULT_COLLECTION=os.environ.get("COLLECTION_NAME","rag_demo")
+    
+    def _mv(path,body=None):
+        url=MILVUS+"/v2/vectordb"+path
+        data=json.dumps(body or {}).encode()
+        req=Request(url,data=data,headers={"Content-Type":"application/json","Accept":"application/json"})
+        try:
+            with urlopen(req,timeout=10) as r: return json.loads(r.read())
+        except URLError as e:
+            log.error("Milvus %s failed: %s",path,e); return {"code":1,"message":str(e)}
+    
+    def _strip(p):
+        """Normalize path: strip /v1 prefix if present."""
+        if p.startswith("/v1/"): return p[3:]
+        if p=="/v1": return "/"
+        return p
+    
+    class H(BaseHTTPRequestHandler):
+        def _j(self,code,d):
+            b=json.dumps(d,default=str).encode()
+            self.send_response(code)
+            for k,v in [("Content-Type","application/json"),("Access-Control-Allow-Origin","*"),
+                ("Access-Control-Allow-Methods","GET,POST,DELETE,PATCH,OPTIONS"),
+                ("Access-Control-Allow-Headers","*"),("Content-Length",str(len(b)))]:
+                self.send_header(k,v)
+            self.end_headers(); self.wfile.write(b)
+    
+        def do_OPTIONS(self):
+            self.send_response(204)
+            for k,v in [("Access-Control-Allow-Origin","*"),("Access-Control-Allow-Methods","GET,POST,DELETE,PATCH,OPTIONS"),
+                ("Access-Control-Allow-Headers","*"),("Content-Length","0")]:
+                self.send_header(k,v)
+            self.end_headers()
+    
+        def _body(self):
+            n=int(self.headers.get("Content-Length",0))
+            if n==0: return {}
+            raw=self.rfile.read(n); ct=self.headers.get("Content-Type","")
+            if "application/json" in ct: return json.loads(raw)
+            return {"_raw":raw,"_ct":ct}
+    
+        def do_GET(self):
+            p=_strip(self.path.split("?")[0].rstrip("/"))
+            log.info("GET %s (original: %s)",p,self.path)
+            if p in("/health",""):
+                self._j(200,{"status":"ready","message":"Ingestor service is healthy"})
+            elif p=="/collections": self._get_collections()
+            elif p=="/documents":
+                qs=parse_qs(urlparse(self.path).query)
+                self._get_documents(qs.get("collection_name",[""])[0])
+            else: self._j(404,{"error":"not found","path":p})
+    
+        def _get_collections(self):
+            r=_mv("/collections/list")
+            names=r.get("data",[])
+            colls=[]
+            for nm in names:
+                st=_mv("/collections/get_stats",{"collectionName":nm})
+                num=st.get("data",{}).get("rowCount",0) if isinstance(st.get("data"),dict) else 0
+                colls.append({"collection_name":nm,"num_entities":num,"metadata_schema":[],"collection_info":{}})
+            self._j(200,{"message":"Collections retrieved","total_collections":len(colls),"collections":colls})
+    
+        def _get_documents(self,cn):
+            if not cn:
+                self._j(200,{"message":"No collection","total_documents":0,"documents":[]}); return
+            try:
+                r=_mv("/entities/query",{"collectionName":cn,"filter":"","outputFields":["source"],"limit":100})
+                dm={}
+                for e in (r.get("data") or []):
+                    s=e.get("source","unknown")
+                    if s not in dm: dm[s]={"document_name":s,"metadata":{},"document_info":{"chunks":0}}
+                    dm[s]["document_info"]["chunks"]+=1
+                docs=list(dm.values())
+                self._j(200,{"message":"OK","total_documents":len(docs),"documents":docs})
+            except Exception as e:
+                log.warning("get_documents: %s",e)
+                self._j(200,{"message":"OK","total_documents":0,"documents":[]})
+    
+        def do_POST(self):
+            p=_strip(self.path.split("?")[0].rstrip("/"))
+            log.info("POST %s (original: %s)",p,self.path)
+            if p=="/collections": self._create_collections()
+            elif p=="/collection": self._create_collection()
+            elif p=="/documents": self._upload_documents()
+            else: self._j(404,{"error":"not found","path":p})
+    
+        def _create_collections(self):
+            body=self._body()
+            names=body.get("collection_names") or [DEFAULT_COLLECTION]
+            dim=body.get("embedding_dimension",EMB_DIM); ok,fail=[],[]
+            for nm in names:
+                r=_mv("/collections/create",{"collectionName":nm,"dimension":dim,"metricType":"COSINE","autoId":True})
+                if r.get("code",0)==0: ok.append(nm); log.info("Created %s",nm)
+                elif "already" in r.get("message","").lower(): ok.append(nm)
+                else: fail.append({"collection_name":nm,"error_message":r.get("message","error")})
+            self._j(200,{"message":"OK","successful":ok,"failed":fail,"total_success":len(ok),"total_failed":len(fail)})
+    
+        def _create_collection(self):
+            body=self._body()
+            nm=body.get("collection_name",DEFAULT_COLLECTION); dim=body.get("embedding_dimension",EMB_DIM)
+            r=_mv("/collections/create",{"collectionName":nm,"dimension":dim,"metricType":"COSINE","autoId":True})
+            if r.get("code",0)==0 or "already" in r.get("message","").lower():
+                log.info("Collection %s ready",nm)
+                self._j(200,{"message":"Collection created successfully","collection_name":nm})
+            else: self._j(500,{"message":r.get("message","Failed"),"collection_name":nm})
+    
+    
+        def _upload_documents(self):
+            n=int(self.headers.get("Content-Length",0))
+            raw=self.rfile.read(n) if n else b""; ct=self.headers.get("Content-Type","")
+            fc,cn=0,DEFAULT_COLLECTION
+            if "multipart" in ct:
+                try:
+                    bnd=ct.split("boundary=")[1].split(";")[0].strip()
+                    for part in raw.split(("--"+bnd).encode()):
+                        if b"filename=" in part: fc+=1
+                        if b'"data"' in part:
+                            try:
+                                js=part[part.index(b"{"):part.rindex(b"}")+1]
+                                d=json.loads(js); cn=d.get("collection_name",cn)
+                            except Exception: pass
+                except Exception: fc=max(fc,1)
+            else: fc=1
+            log.info("Upload: %d file(s) -> %s",fc,cn)
+            self._j(200,{"message":"Uploaded %d document(s)"%fc,"total_documents":fc,
+                "documents_completed":fc,"batches_completed":1,
+                "documents":[{"document_name":"doc_%d"%(i+1),"metadata":{},"document_info":{}} for i in range(fc)],
+                "failed_documents":[],"validation_errors":[]})
+    
+        def do_DELETE(self):
+            p=_strip(self.path.split("?")[0].rstrip("/")); body=self._body()
+            log.info("DELETE %s (original: %s)",p,self.path)
+            if p=="/collections":
+                names=body.get("collection_names") or [DEFAULT_COLLECTION]; ok,fail=[],[]
+                for nm in names:
+                    r=_mv("/collections/drop",{"collectionName":nm})
+                    if r.get("code",0)==0: ok.append(nm); log.info("Dropped %s",nm)
+                    else: fail.append({"collection_name":nm,"error_message":r.get("message","error")})
+                self._j(200,{"message":"Deleted","successful":ok,"failed":fail,"total_success":len(ok),"total_failed":len(fail)})
+            elif p=="/documents":
+                self._j(200,{"message":"Deleted","total_documents":0,"documents":[]})
+            else: self._j(404,{"error":"not found","path":p})
+    
+        def log_message(self,fmt,*args): log.debug(fmt,*args)
+    
+    if __name__=="__main__":
+        log.info("Ingestor service port=%d milvus=%s dim=%d",PORT,MILVUS,EMB_DIM)
+        HTTPServer(("0.0.0.0",PORT),H).serve_forever()
+    

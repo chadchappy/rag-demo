@@ -61,7 +61,7 @@ spec:
       volumes:
         - name: server-script
           configMap:
-            name: mock-nim-server
+            name: nim-service-scripts
 ---
 apiVersion: v1
 kind: Service
@@ -75,4 +75,3 @@ spec:
     - port: {{ $nim.port }}
       targetPort: {{ $nim.port }}
 {{- end }}
-
