@@ -20,12 +20,16 @@ spec:
       containers:
         - name: ingestor
           image: python:3.11-slim
-          command: ["python3", "/scripts/ingestor.py"]
+          command: ["/bin/sh", "-c", "pip install --quiet pypdf && python3 /scripts/ingestor.py"]
           env:
             - name: INGESTOR_PORT
               value: "8082"
             - name: APP_VECTORSTORE_URL
               value: "http://milvus:19530"
+            - name: APP_EMBEDDINGS_SERVERURL
+              value: "http://nemoretriever-embedding-ms:8000/v1"
+            - name: APP_EMBEDDINGS_MODELNAME
+              value: "nvidia/llama-3.2-nv-embedqa-1b-v2"
             - name: APP_EMBEDDINGS_DIMENSIONS
               value: "1024"
             - name: COLLECTION_NAME
@@ -36,22 +40,22 @@ spec:
             - containerPort: 8082
           resources:
             requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
-              cpu: "500m"
+              cpu: "200m"
               memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
           readinessProbe:
             httpGet:
               path: /v1/health
               port: 8082
-            initialDelaySeconds: 5
+            initialDelaySeconds: 30
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /v1/health
               port: 8082
-            initialDelaySeconds: 5
+            initialDelaySeconds: 30
             periodSeconds: 15
           volumeMounts:
             - name: ingestor-script

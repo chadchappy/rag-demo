@@ -151,62 +151,7 @@ spec:
     - port: 3000
       targetPort: 3000
 ---
-# Mock ingestor-server deployment — handles collection/document management APIs
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: mock-ingestor
-  namespace: {{ $ns }}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: mock-ingestor
-  template:
-    metadata:
-      labels:
-        app: mock-ingestor
-    spec:
-      containers:
-        - name: ingestor
-          image: python:3.11-slim
-          command: ["python3", "-u", "/app/server.py"]
-          env:
-            - name: PYTHONUNBUFFERED
-              value: "1"
-            - name: INGESTOR_PORT
-              value: "8082"
-            - name: MILVUS_URL
-              value: "http://milvus:19530"
-            - name: EMBEDDING_DIM
-              value: "1024"
-            - name: EMBEDDING_URL
-              value: "http://nemoretriever-embedding-ms:8000/v1/embeddings"
-          ports:
-            - containerPort: 8082
-          volumeMounts:
-            - name: server-script
-              mountPath: /app
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 256Mi
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 8082
-            initialDelaySeconds: 3
-            periodSeconds: 10
-      volumes:
-        - name: server-script
-          configMap:
-            name: mock-ingestor-server
----
-# Ingestor-server service — the rag-playground frontend expects this
-# for document/collection management.
+# Ingestor-server service — routes to the real ingestor-server deployment
 apiVersion: v1
 kind: Service
 metadata:
@@ -214,7 +159,7 @@ metadata:
   namespace: {{ $ns }}
 spec:
   selector:
-    app: mock-ingestor
+    app: ingestor-server
   ports:
     - port: 8082
       targetPort: 8082
